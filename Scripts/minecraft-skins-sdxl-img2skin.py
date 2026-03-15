@@ -36,18 +36,17 @@ TRANSPARENT_REGIONS = [
 
 
 def get_background_color(image):
-    pixels = []
-    for region in BACKGROUND_REGIONS:
-        swatch = image.crop(region)
-        width, height = swatch.size
-        np_swatch = np.array(swatch)
-        np_swatch = np_swatch.reshape(width * height, 3)
-        if len(pixels) == 0:
-            pixels = np_swatch
-        else:
-            np.concatenate((pixels, np_swatch))
-    (r, g, b) = np.mean(np_swatch, axis=0, dtype=int)
-    return [(r, g, b)]
+     pixels = []
+     for region in BACKGROUND_REGIONS:
+         swatch = image.crop(region)
+         width, height = swatch.size
+         np_swatch = np.array(swatch).reshape(width * height, 3)
+         if len(pixels) == 0:
+             pixels = np_swatch
+         else:
+             pixels = np.concatenate((pixels, np_swatch))
+     (r, g, b) = np.mean(pixels, axis=0, dtype=int)
+     return [(r, g, b)]
 
 
 def restore_region_transparency(image, region, transparency_color, cutoff=50):
@@ -87,28 +86,35 @@ def extract_minecraft_skin(generated_image, cutoff=50):
 # --- 新增：圖片轉皮膚功能 ---
 
 def load_pipeline(device, dtype):
-    """加載 SDXL 管線並掛載 IP-Adapter"""
-    logger.info(f"Loading model: {MODEL_NAME}")
-    if device == "cpu":
-        pipeline = StableDiffusionXLPipeline.from_pretrained(MODEL_NAME)
-    else:
-        pipeline = StableDiffusionXLPipeline.from_pretrained(
-            MODEL_NAME, torch_dtype=dtype
-        )
-    pipeline.to(device)
+     """加載 SDXL 管線並掛載 IP-Adapter"""
+     logger.info(f"Loading model: {MODEL_NAME}")
+     
+     pipeline = StableDiffusionXLPipeline.from_pretrained(
+         MODEL_NAME, torch_dtype=dtype
+     )
 
-    # 加載 IP-Adapter（diffusers 內建支持，自動處理圖片編碼）
-    logger.info("Loading IP-Adapter...")
-    pipeline.load_ip_adapter(
-        "h94/IP-Adapter",
-        subfolder="sdxl_models",
-        weight_name="ip-adapter_sdxl.bin",
-    )
+     # 先加載 IP-Adapter，再一次性移到 GPU（確保所有權重都在同一設備）
+     logger.info("Loading IP-Adapter...")
+     pipeline.load_ip_adapter(
+         "h94/IP-Adapter",
+         subfolder="sdxl_models",
+         weight_name="ip-adapter_sdxl.bin",
+     )
+     logger.info("IP-Adapter loaded successfully")
 
-    # 內存優化
-    pipeline.enable_attention_slicing()
+     pipeline.to(device)
+     logger.info(f"Full pipeline moved to device: {device}")
 
-    return pipeline
+     if device == "cuda":
+         vram_used = torch.cuda.memory_allocated() / 1e9
+         vram_total = torch.cuda.get_device_properties(0).total_memory / 1e9
+         print(f"GPU VRAM used: {vram_used:.2f} GB / {vram_total:.1f} GB")
+
+     # 內存優化（注意：不能用 enable_attention_slicing，它會覆蓋 IP-Adapter 的 attention processor）
+     pipeline.enable_vae_slicing()
+     logger.info("Memory optimizations enabled")
+
+     return pipeline
 
 
 def generate_skin_from_image(
@@ -158,65 +164,80 @@ def generate_skin_from_image(
 
 
 def main():
-    args = parse_args()
+     try:
+         args = parse_args()
 
-    if args.verbose:
-        logger.setLevel(logging.INFO)
+         if args.verbose:
+             logger.setLevel(logging.INFO)
 
-    # 設置精度
-    dtype = torch.float16 if args.model_precision_type == "fp16" else torch.float32
+         # 設置精度
+         dtype = torch.float16 if args.model_precision_type == "fp16" else torch.float32
 
-    # 設備檢測
-    if torch.cuda.is_available() and torch.backends.cuda.is_built():
-        device = "cuda"
-        print("CUDA device found, enabling.")
-    elif torch.backends.mps.is_available() and torch.backends.mps.is_built():
-        device = "mps"
-        print("Apple MPS device found, enabling.")
-    else:
-        device = "cpu"
-        print("No CUDA or MPS devices found, running on CPU.")
+         # 設備檢測
+         if torch.cuda.is_available() and torch.backends.cuda.is_built():
+             device = "cuda"
+             print("CUDA device found, enabling.")
+         elif torch.backends.mps.is_available() and torch.backends.mps.is_built():
+             device = "mps"
+             print("Apple MPS device found, enabling.")
+         else:
+             device = "cpu"
+             print("No CUDA or MPS devices found, running on CPU.")
 
-    # 1. 預處理參考圖片
-    logger.info(f"Preprocessing reference image: {args.input_image}")
-    from image_preprocessor import ImagePreprocessor
+         # 1. 預處理參考圖片
+         logger.info(f"Preprocessing reference image: {args.input_image}")
+         from image_preprocessor import ImagePreprocessor
 
-    preprocessor = ImagePreprocessor()
-    reference_image = preprocessor.process(args.input_image)
-    logger.info("Reference image preprocessed.")
+         if not os.path.exists(args.input_image):
+             raise FileNotFoundError(f"Input image not found: {args.input_image}")
 
-    # 2. 加載 pipeline + IP-Adapter
-    pipeline = load_pipeline(device, dtype)
+         preprocessor = ImagePreprocessor()
+         reference_image = preprocessor.process(args.input_image)
+         logger.info("Reference image preprocessed.")
 
-    # 3. 生成皮膚
-    generated_image = generate_skin_from_image(
-        pipeline=pipeline,
-        reference_image=reference_image,
-        prompt=args.prompt,
-        ip_adapter_scale=args.ip_adapter_scale,
-        num_inference_steps=args.num_inference_steps,
-        guidance_scale=args.guidance_scale,
-        seed=args.seed,
-        device=device,
-    )
+         # 2. 加載 pipeline + IP-Adapter
+         pipeline = load_pipeline(device, dtype)
 
-    # 4. 後處理：裁剪 + 縮放 + 恢復透明度（復用現有邏輯）
-    logger.info("Extracting Minecraft skin from generated image.")
-    minecraft_skin = extract_minecraft_skin(generated_image)
+         # 3. 生成皮膚
+         generated_image = generate_skin_from_image(
+             pipeline=pipeline,
+             reference_image=reference_image,
+             prompt=args.prompt,
+             ip_adapter_scale=args.ip_adapter_scale,
+             num_inference_steps=args.num_inference_steps,
+             guidance_scale=args.guidance_scale,
+             seed=args.seed,
+             device=device,
+         )
 
-    # 5. 保存
-    os.makedirs("output_minecraft_skins", exist_ok=True)
-    output_path = os.path.join("output_minecraft_skins", args.filename)
-    minecraft_skin.save(output_path)
-    logger.info(f"Skin saved to: {output_path}")
+         # 4. 後處理：裁剪 + 縮放 + 恢復透明度（復用現有邏輯）
+         logger.info("Extracting Minecraft skin from generated image.")
+         minecraft_skin = extract_minecraft_skin(generated_image)
 
-    print(f"Successfully generated skin from image: {output_path}")
+         # 5. 保存
+         os.makedirs("output_minecraft_skins", exist_ok=True)
+         output_path = os.path.join("output_minecraft_skins", args.filename)
+         minecraft_skin.save(output_path)
+         logger.info(f"Skin saved to: {output_path}")
 
-    # 6. 可選 3D 模型
-    if args.model_3d:
-        os.chdir("Scripts")
-        os.system(f"python to_3d_model.py '{args.filename}'")
-        os.chdir("..")
+         print(f"✅ Successfully generated skin from image: {output_path}")
+
+         # 6. 可選 3D 模型
+         if args.model_3d:
+             logger.info("Generating 3D model preview...")
+             os.chdir("Scripts")
+             ret = os.system(f"python to_3d_model.py '{args.filename}'")
+             os.chdir("..")
+             if ret == 0:
+                 print("✅ 3D model generated successfully")
+             else:
+                 print("⚠️ 3D model generation failed (non-critical)")
+
+     except Exception as e:
+         print(f"❌ Error: {e}", file=sys.stderr)
+         import traceback
+         traceback.print_exc()
+         sys.exit(1)
 
 
 def parse_args():
@@ -281,11 +302,12 @@ def parse_args():
     return parser.parse_args()
 
 
+logger = logging.getLogger("minecraft-skins-img2skin")
+
 if __name__ == "__main__":
     logging.basicConfig(
         stream=sys.stdout,
         level=logging.ERROR,
         format="[%(asctime)s] %(levelname)s - %(message)s",
     )
-    logger = logging.getLogger("minecraft-skins-img2skin")
     main()

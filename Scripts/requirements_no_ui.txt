@@ -5,6 +5,9 @@ protobuf
 accelerate
 sentencepiece
 transformers
-diffusers
+diffusers>=0.30.0
 Pillow===10.4.0
 pygltflib
+rembg
+opencv-python
+onnxruntime
